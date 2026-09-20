@@ -62,7 +62,17 @@ class Automaton(Generic[State, Input, Output]):
             initial = _NO_STATE  # type:ignore[assignment]
         assert initial is not None
         self._initialState: State = initial
-        self._transitions: set[tuple[State, Input, State, Sequence[Output]]] = set()
+        # Transitions are indexed by (in-state, input symbol) so that both
+        # registration and runtime lookup are O(1); the dict preserves
+        # first-registration order, which is the canonical iteration order
+        # for diagnostics and visualization.
+        self._transitions: dict[
+            tuple[State, Input], tuple[State, tuple[Output, ...]]
+        ] = {}
+        # A secondary index of outgoing edges per state: each value lists
+        # the (in-state, input symbol) keys of that state's transitions, in
+        # first-registration order.
+        self._outgoingTransitions: dict[State, list[tuple[State, Input]]] = {}
         self._unhandledTransition: Optional[tuple[State, Sequence[Output]]] = None
 
     @property
@@ -97,17 +107,17 @@ class Automaton(Generic[State, Input, Output]):
         Add the given transition to the outputSymbol. Raise ValueError if
         there is already a transition with the same inState and inputSymbol.
         """
-        # keeping self._transitions in a flat list makes addTransition
-        # O(n^2), but state machines don't tend to have hundreds of
-        # transitions.
-        for anInState, anInputSymbol, anOutState, _ in self._transitions:
-            if anInState == inState and anInputSymbol == inputSymbol:
-                raise ValueError(
-                    "already have transition from {} to {} via {}".format(
-                        inState, anOutState, inputSymbol
-                    )
+        key = (inState, inputSymbol)
+        if key in self._transitions:
+            anOutState, _ = self._transitions[key]
+            raise ValueError(
+                "already have transition from {} to {} via {}".format(
+                    inState, anOutState, inputSymbol
                 )
-        self._transitions.add((inState, inputSymbol, outState, tuple(outputSymbols)))
+            )
+        outputs = tuple(outputSymbols)
+        self._transitions[key] = (outState, outputs)
+        self._outgoingTransitions.setdefault(inState, []).append(key)
 
     def unhandledTransition(
         self, outState: State, outputSymbols: Sequence[Output]
@@ -122,16 +132,43 @@ class Automaton(Generic[State, Input, Output]):
         """
         All transitions.
         """
-        return frozenset(self._transitions)
+        return frozenset(
+            (inState, inputSymbol, outState, outputSymbols)
+            for (inState, inputSymbol), (
+                outState,
+                outputSymbols,
+            ) in self._transitions.items()
+        )
+
+    def transitions(self) -> tuple[tuple[State, Input, State, Sequence[Output]], ...]:
+        """
+        All transitions, in the order they were first registered.
+        """
+        return tuple(
+            (inState, inputSymbol, outState, outputSymbols)
+            for (inState, inputSymbol), (
+                outState,
+                outputSymbols,
+            ) in self._transitions.items()
+        )
+
+    def transitionsFrom(
+        self, inState: State
+    ) -> tuple[tuple[Input, State, Sequence[Output]], ...]:
+        """
+        All transitions leaving C{inState}, as (inputSymbol, outState,
+        outputSymbols) triples, in the order they were first registered.
+        """
+        return tuple(
+            (inputSymbol, *self._transitions[(state, inputSymbol)])
+            for (state, inputSymbol) in self._outgoingTransitions.get(inState, ())
+        )
 
     def inputAlphabet(self) -> set[Input]:
         """
         The full set of symbols acceptable to this automaton.
         """
-        return {
-            inputSymbol
-            for (inState, inputSymbol, outState, outputSymbol) in self._transitions
-        }
+        return {inputSymbol for (inState, inputSymbol) in self._transitions}
 
     def outputAlphabet(self) -> set[Output]:
         """
@@ -140,7 +177,7 @@ class Automaton(Generic[State, Input, Output]):
         return set(
             chain.from_iterable(
                 outputSymbols
-                for (inState, inputSymbol, outState, outputSymbols) in self._transitions
+                for (outState, outputSymbols) in self._transitions.values()
             )
         )
 
@@ -152,7 +189,10 @@ class Automaton(Generic[State, Input, Output]):
         return frozenset(
             chain.from_iterable(
                 (inState, outState)
-                for (inState, inputSymbol, outState, outputSymbol) in self._transitions
+                for (
+                    (inState, inputSymbol),
+                    (outState, outputSymbols),
+                ) in self._transitions.items()
             )
         )
 
@@ -162,9 +202,10 @@ class Automaton(Generic[State, Input, Output]):
         """
         A 2-tuple of (outState, outputSymbols) for inputSymbol.
         """
-        for anInState, anInputSymbol, outState, outputSymbols in self._transitions:
-            if (inState, inputSymbol) == (anInState, anInputSymbol):
-                return (outState, list(outputSymbols))
+        transition = self._transitions.get((inState, inputSymbol))
+        if transition is not None:
+            outState, outputSymbols = transition
+            return (outState, list(outputSymbols))
         if self._unhandledTransition is None:
             raise NoTransition(state=inState, symbol=inputSymbol)
         return self._unhandledTransition

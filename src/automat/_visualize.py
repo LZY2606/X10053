@@ -98,7 +98,15 @@ def makeDigraph(
         edge_attr={"fontname": "Menlo"},
     )
 
-    for state in automaton.states():
+    # States are emitted in first-registration order (the order states
+    # first appear in the registered transitions), so that the generated
+    # graph is deterministic; automaton.states() is an unordered frozenset.
+    orderedStates: dict[State, None] = {}
+    for inState, _, outState, _ in automaton.transitions():
+        orderedStates.setdefault(inState)
+        orderedStates.setdefault(outState)
+
+    for state in orderedStates:
         if state is automaton.initialState:
             stateShape = "bold"
             fontName = "Menlo-Bold"
@@ -112,7 +120,7 @@ def makeDigraph(
             style=stateShape,
             color="blue",
         )
-    for n, eachTransition in enumerate(automaton.allTransitions()):
+    for n, eachTransition in enumerate(automaton.transitions()):
         inState, inputSymbol, outState, outputSymbols = eachTransition
         thisTransition = "t{}".format(n)
         inputLabel = inputAsString(inputSymbol)
