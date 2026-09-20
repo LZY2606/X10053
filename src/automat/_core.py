@@ -8,8 +8,15 @@ Perhaps something that could be replaced with or integrated into machinist.
 from __future__ import annotations
 
 import sys
-from itertools import chain
-from typing import Callable, Generic, Optional, Sequence, TypeVar, Hashable
+from typing import (
+    Callable,
+    Generic,
+    Iterable,
+    Optional,
+    Sequence,
+    TypeVar,
+    Hashable,
+)
 
 if sys.version_info >= (3, 10):
     from typing import TypeAlias
@@ -56,13 +63,30 @@ class Automaton(Generic[State, Input, Output]):
 
     def __init__(self, initial: State | None = None) -> None:
         """
-        Initialize the set of transitions and the initial state.
+        Initialize the transition indexes and the initial state.
+
+        Transitions are kept in two coupled indexes:
+
+            - C{self._byInput}: C{(in-state, input) -> (out-state, outputs)}
+              for O(1) duplicate detection during construction and O(1)
+              lookup at runtime, and
+            - C{self._outgoing}: C{in-state -> {input -> (out-state,
+              outputs)}} for enumeration of a state's outgoing edges.
+
+        Both are ordinary C{dict}s, whose iteration order is the order in
+        which keys were first inserted, so enumeration deterministically
+        follows registration order without any sorting.  The flat
+        C{set}-of-tuples storage used previously enumerated in hash order,
+        which made conflict diagnostics and graph output sensitive to hash
+        collisions and table growth, and made construction and lookup linear
+        in the total number of transitions.
         """
         if initial is None:
             initial = _NO_STATE  # type:ignore[assignment]
         assert initial is not None
         self._initialState: State = initial
-        self._transitions: set[tuple[State, Input, State, Sequence[Output]]] = set()
+        self._byInput: dict[tuple[State, Input], tuple[State, Sequence[Output]]] = {}
+        self._outgoing: dict[State, dict[Input, tuple[State, Sequence[Output]]]] = {}
         self._unhandledTransition: Optional[tuple[State, Sequence[Output]]] = None
 
     @property
@@ -97,17 +121,24 @@ class Automaton(Generic[State, Input, Output]):
         Add the given transition to the outputSymbol. Raise ValueError if
         there is already a transition with the same inState and inputSymbol.
         """
-        # keeping self._transitions in a flat list makes addTransition
-        # O(n^2), but state machines don't tend to have hundreds of
-        # transitions.
-        for anInState, anInputSymbol, anOutState, _ in self._transitions:
-            if anInState == inState and anInputSymbol == inputSymbol:
-                raise ValueError(
-                    "already have transition from {} to {} via {}".format(
-                        inState, anOutState, inputSymbol
-                    )
+        # Coerce the outputs first: the legacy implementation iterated
+        # outputSymbols while scanning for duplicates, so a non-iterable
+        # argument raised TypeError before the duplicate ValueError even
+        # though the scan itself happened first.  Materializing the tuple
+        # up front preserves that error priority and keeps storage immutable.
+        storedOutputs: tuple[Output, ...] = tuple(outputSymbols)
+        key = (inState, inputSymbol)
+        existing = self._byInput.get(key)
+        if existing is not None:
+            (anOutState, _) = existing
+            raise ValueError(
+                "already have transition from {} to {} via {}".format(
+                    inState, anOutState, inputSymbol
                 )
-        self._transitions.add((inState, inputSymbol, outState, tuple(outputSymbols)))
+            )
+        value = (outState, storedOutputs)
+        self._byInput[key] = value
+        self._outgoing.setdefault(inState, {})[inputSymbol] = value
 
     def unhandledTransition(
         self, outState: State, outputSymbols: Sequence[Output]
@@ -121,40 +152,80 @@ class Automaton(Generic[State, Input, Output]):
     def allTransitions(self) -> frozenset[tuple[State, Input, State, Sequence[Output]]]:
         """
         All transitions.
+
+        The returned C{frozenset} preserves the historical set-based
+        contract.  It cannot express an order; use
+        L{transitionsInRegistrationOrder} for deterministic enumeration.
         """
-        return frozenset(self._transitions)
+        return frozenset(self._records())
+
+    def _records(
+        self,
+    ) -> Iterable[tuple[State, Input, State, Sequence[Output]]]:
+        """
+        Every transition as a 4-tuple, in first-registration order.
+        """
+        for (inState, inputSymbol), (
+            outState,
+            outputSymbols,
+        ) in self._byInput.items():
+            yield (inState, inputSymbol, outState, outputSymbols)
+
+    def transitionsInRegistrationOrder(
+        self,
+    ) -> tuple[tuple[State, Input, State, Sequence[Output]], ...]:
+        """
+        All transitions as a tuple of C{(in-state, input, out-state,
+        outputs)} records, in the order in which they were first registered.
+
+        Unlike L{allTransitions}, this preserves order for consumers (such as
+        graph generation) that need deterministic, registration-ordered
+        enumeration rather than set semantics.
+        """
+        return tuple(self._records())
 
     def inputAlphabet(self) -> set[Input]:
         """
         The full set of symbols acceptable to this automaton.
         """
-        return {
-            inputSymbol
-            for (inState, inputSymbol, outState, outputSymbol) in self._transitions
-        }
+        return {inputSymbol for (_, inputSymbol) in self._byInput}
 
     def outputAlphabet(self) -> set[Output]:
         """
         The full set of symbols which can be produced by this automaton.
         """
-        return set(
-            chain.from_iterable(
-                outputSymbols
-                for (inState, inputSymbol, outState, outputSymbols) in self._transitions
-            )
-        )
+        return {
+            outputSymbol
+            for (_, outputSymbols) in self._byInput.values()
+            for outputSymbol in outputSymbols
+        }
 
     def states(self) -> frozenset[State]:
         """
         All valid states; "Q" in the mathematical description of a state
         machine.
         """
-        return frozenset(
-            chain.from_iterable(
-                (inState, outState)
-                for (inState, inputSymbol, outState, outputSymbol) in self._transitions
-            )
-        )
+        states = set(self._outgoing)
+        states.update(outState for (outState, _) in self._byInput.values())
+        return frozenset(states)
+
+    def outputsFromState(
+        self, inState: State
+    ) -> list[tuple[Input, State, Sequence[Output]]]:
+        """
+        All outgoing edges of C{inState} as C{(input, outState, outputs)}
+        triples, in first-registration order.
+
+        This is the state-keyed companion of L{allTransitions}; it returns an
+        empty list for states that never originate a transition.
+        """
+        edges = self._outgoing.get(inState)
+        if edges is None:
+            return []
+        return [
+            (inputSymbol, outState, outputSymbols)
+            for inputSymbol, (outState, outputSymbols) in edges.items()
+        ]
 
     def outputForInput(
         self, inState: State, inputSymbol: Input
@@ -162,9 +233,10 @@ class Automaton(Generic[State, Input, Output]):
         """
         A 2-tuple of (outState, outputSymbols) for inputSymbol.
         """
-        for anInState, anInputSymbol, outState, outputSymbols in self._transitions:
-            if (inState, inputSymbol) == (anInState, anInputSymbol):
-                return (outState, list(outputSymbols))
+        indexed = self._byInput.get((inState, inputSymbol))
+        if indexed is not None:
+            (outState, outputSymbols) = indexed
+            return (outState, list(outputSymbols))
         if self._unhandledTransition is None:
             raise NoTransition(state=inState, symbol=inputSymbol)
         return self._unhandledTransition

@@ -112,7 +112,7 @@ def makeDigraph(
             style=stateShape,
             color="blue",
         )
-    for n, eachTransition in enumerate(automaton.allTransitions()):
+    for n, eachTransition in enumerate(automaton.transitionsInRegistrationOrder()):
         inState, inputSymbol, outState, outputSymbols = eachTransition
         thisTransition = "t{}".format(n)
         inputLabel = inputAsString(inputSymbol)
